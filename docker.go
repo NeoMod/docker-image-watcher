@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,17 +19,19 @@ import (
 var dockerSocket = "/var/run/docker.sock"
 
 type dockerContainer struct {
-	ID      string   `json:"Id"`
-	Names   []string `json:"Names"`
-	Image   string   `json:"Image"`
-	ImageID string   `json:"ImageID"`
+	ID      string            `json:"Id"`
+	Names   []string          `json:"Names"`
+	Image   string            `json:"Image"`
+	ImageID string            `json:"ImageID"`
+	Labels  map[string]string `json:"Labels"`
 }
 
 type dockerInspect struct {
-	ID         string          `json:"Id"`
-	Name       string          `json:"Name"`
-	Config     json.RawMessage `json:"Config"`
-	HostConfig json.RawMessage `json:"HostConfig"`
+	ID              string          `json:"Id"`
+	Name            string          `json:"Name"`
+	Config          json.RawMessage `json:"Config"`
+	HostConfig      json.RawMessage `json:"HostConfig"`
+	NetworkSettings json.RawMessage `json:"NetworkSettings"`
 }
 
 func dockerClient() *http.Client {
@@ -293,6 +296,30 @@ func getImageDigest(imageID string) (string, error) {
 	return "", fmt.Errorf("no digest found")
 }
 
+func localDigestMatches(imageID, imageTag, remoteDigest string) bool {
+	for _, ref := range []string{imageID, imageTag} {
+		if ref == "" {
+			continue
+		}
+		resp, err := dockerAPI("GET", "/images/"+ref+"/json", nil)
+		if err != nil {
+			continue
+		}
+		var data struct {
+			RepoDigests []string `json:"RepoDigests"`
+		}
+		json.NewDecoder(resp.Body).Decode(&data)
+		resp.Body.Close()
+		for _, d := range data.RepoDigests {
+			_, after, ok := strings.Cut(d, "@")
+			if ok && after == remoteDigest {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func resolveImageName(imageID string) string {
 	resp, err := dockerAPI("GET", "/images/"+imageID+"/json", nil)
 	if err != nil {
@@ -326,40 +353,31 @@ func recreateContainer(id, image string) error {
 	createBody["Image"] = image
 	delete(createBody, "Hostname")
 
-	type hostCfg struct {
-		Binds         []string               `json:"Binds"`
-		PortBindings  map[string]interface{} `json:"PortBindings"`
-		RestartPolicy map[string]interface{} `json:"RestartPolicy"`
-		NetworkMode   string                 `json:"NetworkMode"`
-		Privileged    bool                   `json:"Privileged"`
-		ExtraHosts    []string               `json:"ExtraHosts"`
-		DNS           []string               `json:"Dns"`
-		CapAdd        []string               `json:"CapAdd"`
-		CapDrop       []string               `json:"CapDrop"`
-		Devices       []interface{}          `json:"Devices"`
-		ShmSize       int64                  `json:"ShmSize"`
-		Sysctls       map[string]string      `json:"Sysctls"`
-		Runtime       string                 `json:"Runtime"`
-		GroupAdd      []string               `json:"GroupAdd"`
-		IpcMode       string                 `json:"IpcMode"`
-		PidMode       string                 `json:"PidMode"`
-		UsernsMode    string                 `json:"UsernsMode"`
-		UTSMode       string                 `json:"UTSMode"`
-	}
-
-	var hc hostCfg
-	if err := json.Unmarshal(inspect.HostConfig, &hc); err != nil {
+	var hostConfig map[string]interface{}
+	if err := json.Unmarshal(inspect.HostConfig, &hostConfig); err != nil {
 		return fmt.Errorf("unmarshal host config: %w", err)
 	}
-	createBody["HostConfig"] = hc
+	createBody["HostConfig"] = hostConfig
 
-	if hc.NetworkMode != "" && hc.NetworkMode != "default" && hc.NetworkMode != "bridge" {
-		netConfig := map[string]interface{}{
-			"EndpointsConfig": map[string]interface{}{
-				hc.NetworkMode: map[string]interface{}{},
-			},
+	if inspect.NetworkSettings != nil {
+		var netSettings struct {
+			Networks map[string]map[string]interface{} `json:"Networks"`
 		}
-		createBody["NetworkingConfig"] = netConfig
+		if err := json.Unmarshal(inspect.NetworkSettings, &netSettings); err == nil && len(netSettings.Networks) > 0 {
+			endpoints := make(map[string]interface{}, len(netSettings.Networks))
+			for netName, netData := range netSettings.Networks {
+				ep := map[string]interface{}{}
+				for _, k := range []string{"IPAMConfig", "Aliases", "Links", "DriverOpts"} {
+					if v, ok := netData[k]; ok {
+						ep[k] = v
+					}
+				}
+				endpoints[netName] = ep
+			}
+			createBody["NetworkingConfig"] = map[string]interface{}{
+				"EndpointsConfig": endpoints,
+			}
+		}
 	}
 
 	body, err := json.Marshal(createBody)
@@ -418,7 +436,20 @@ func recreateContainer(id, image string) error {
 	if err != nil {
 		return fmt.Errorf("start container %s: %w", created.ID, err)
 	}
+	if resp != nil && resp.StatusCode >= 400 {
+		return fmt.Errorf("start container %s: daemon returned %s", created.ID, resp.Status)
+	}
 	return nil
+}
+
+func pruneUnusedImages() {
+	resp, err := dockerAPI("POST", "/images/prune?filters="+url.QueryEscape(`{"dangling":{"true":true}}`), nil)
+	if resp != nil {
+		resp.Body.Close()
+	}
+	if err != nil {
+		log.Printf("prune images: %v", err)
+	}
 }
 
 func init() {

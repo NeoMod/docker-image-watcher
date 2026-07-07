@@ -61,7 +61,7 @@ td { font-size: .875rem; font-family: "SFMono-Regular",Consolas,"Liberation Mono
 </style>
 </head>
 <body>
-<h1>🐳 <span id="appTitle">Docker Image Watcher</span> <small id="status"></small> <span style="margin-left:auto;display:flex;align-items:center;gap:8px"><button id="updateAllBtn" class="btn btn-group" onclick="doGlobalUpdate()" hidden></button><a href="#" id="langSwitch" style="color:#64748b;text-decoration:none;font-size:.75rem" onclick="switchLang();return false">IT</a><a href="#" id="logoutLink" style="color:#ef4444;text-decoration:none;font-size:.75rem" onclick="doLogout();return false">Logout</a><label style="font-size:.8rem;font-weight:400;display:flex;align-items:center;gap:6px;cursor:pointer"><span id="hideLabel">Hide up to date</span> <div class="toggle on" id="hideToggle"></div></label></span></h1>
+<h1>🐳 <span id="appTitle">Docker Image Watcher</span> <small id="status"></small> <span style="margin-left:auto;display:flex;align-items:center;gap:8px"><button id="pruneBtn" class="btn btn-group" onclick="doPrune()" title="Prune unused images"></button><button id="updateAllBtn" class="btn btn-group" onclick="doGlobalUpdate()" hidden></button><a href="#" id="langSwitch" style="color:#64748b;text-decoration:none;font-size:.75rem" onclick="switchLang();return false">IT</a><a href="#" id="logoutLink" style="color:#ef4444;text-decoration:none;font-size:.75rem" onclick="doLogout();return false">Logout</a><label style="font-size:.8rem;font-weight:400;display:flex;align-items:center;gap:6px;cursor:pointer"><span id="hideLabel">Hide up to date</span> <div class="toggle on" id="hideToggle"></div></label></span></h1>
 <div class="warning-banner" id="rateLimitBanner" hidden>
   <div>
     <strong id="rateLimitTitle"></strong>
@@ -106,6 +106,11 @@ const i18n = {
     unknown: '❓ Unknown',
     update: 'Update',
     updateAll: (n) => `Update all (${n})`,
+    prune: 'Prune unused images',
+    pruning: 'pruning...',
+    pruneProgress: 'Pruning in progress...',
+    pruneSuccess: '✅ Done',
+    pruneError: '❌ Action failed',
     lastCheck: 'Last check: ',
     upToDate: 'up to date',
     outdatedLabel: 'outdated',
@@ -139,6 +144,11 @@ const i18n = {
     unknown: '❓ Sconosciuto',
     update: 'Aggiorna',
     updateAll: (n) => `Aggiorna tutti (${n})`,
+    prune: 'Prune immagini unused',
+    pruning: 'pulizia...',
+    pruneProgress: 'Operazione in corso...',
+    pruneSuccess: '✅ Operazione effettuata',
+    pruneError: '❌ Errore azione',
     lastCheck: 'Ultimo controllo: ',
     upToDate: 'aggiornati',
     outdatedLabel: 'da aggiornare',
@@ -172,6 +182,7 @@ function applyL10N() {
   document.getElementById('thDigest').textContent = t.digest;
   document.getElementById('thStatus').textContent = t.status;
   document.getElementById('thAuto').textContent = t.auto;
+  document.getElementById('pruneBtn').textContent = t.prune;
   document.getElementById('logoutLink').textContent = t.logout;
   document.getElementById('rateLimitTitle').textContent = t.rateLimitTitle;
   document.getElementById('rateLimitBody').textContent = t.rateLimitBody;
@@ -200,6 +211,9 @@ function dismissRateLimit() {
 }
 
 async function load() {
+  const pruneBtn = document.getElementById('pruneBtn');
+  pruneBtn.disabled = false;
+  pruneBtn.textContent = t.prune;
   const bar = document.getElementById('status');
   bar.textContent = t.checking;
   bar.parentElement.classList.add('checking');
@@ -252,7 +266,7 @@ function render(groups) {
           <td class="name-cell"><span class="container-name">├─ ${esc(c.container_name)}</span></td>
           <td class="digest">${esc(c.local_digest)}</td>
           <td></td>
-          <td><div class="toggle ${c.auto_update ? 'on' : ''}" data-cid="${esc(c.container_id)}" onclick="toggle(this)"></div></td>
+          <td><div class="toggle ${c.auto_update ? 'on' : ''}" style="cursor:default"></div></td>
           <td><div class="progress-cell" id="progress-${esc(c.container_id)}">${isUpdating ? '<div class="progress-bar"><div class="bar"><div class="fill" style="width:0%"></div></div><span class="pct">0%</span></div>' : `<button class="btn btn-update" data-cid="${esc(c.container_id)}" onclick="doUpdate(this)" ${c.status !== 'outdated' ? 'disabled' : ''}>${esc(t.update)}</button>`}</div>${c.error ? `<div style="color:#ef4444;font-size:.7rem;margin-top:4px;word-break:break-all">${esc(c.error)}</div>` : ''}</td>
         </tr>`;
       }
@@ -265,18 +279,6 @@ function render(groups) {
     <span><span class="dot dot-yellow"></span>${counts.partial || 0} ${esc(t.partialLabel)}</span>
     <span><span class="dot dot-gray"></span>${counts.unknown || 0} ${esc(t.unknownLabel)}</span>`;
   document.getElementById('lastCheck').textContent = t.lastCheck + new Date().toLocaleTimeString();
-}
-
-async function toggle(el) {
-  const cid = el.dataset.cid;
-  el.classList.toggle('on');
-  try {
-    const res = await fetch(`/api/images/${cid}/auto-update`, { method: 'POST' });
-    const data = await res.json();
-    el.classList.toggle('on', data.auto_update);
-  } catch(e) {
-    el.classList.toggle('on');
-  }
 }
 
 async function doUpdate(btn) {
@@ -313,6 +315,24 @@ async function doGroupUpdate(btn) {
     setTimeout(load, 2000);
   } catch(e) {
     btn.textContent = t.errorLabel;
+  }
+}
+
+async function doPrune() {
+  const btn = document.getElementById('pruneBtn');
+  btn.disabled = true;
+  btn.textContent = t.pruning;
+  try {
+    const res = await fetch('/api/prune', { method: 'POST' });
+    if (!res.ok) { btn.textContent = t.pruneError; setTimeout(load, 3000); return; }
+    btn.textContent = t.pruneProgress;
+    setTimeout(() => {
+      btn.textContent = t.pruneSuccess;
+      setTimeout(load, 2000);
+    }, 2000);
+  } catch(_) {
+    btn.textContent = t.pruneError;
+    setTimeout(load, 3000);
   }
 }
 

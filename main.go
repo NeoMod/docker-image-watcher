@@ -215,8 +215,6 @@ type ImageGroup struct {
 type App struct {
 	mu              sync.RWMutex
 	images          []ImageGroup
-	autoFile        string
-	autoSaved       map[string]bool
 	cooldowns       map[string]time.Time
 	containerErrors map[string]string
 	rateLimited     bool
@@ -230,18 +228,11 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	autoFile := os.Getenv("AUTO_FILE")
-	if autoFile == "" {
-		autoFile = "/data/auto-update.json"
-	}
 
 	app := &App{
-		autoFile:        autoFile,
-		autoSaved:       make(map[string]bool),
 		cooldowns:       make(map[string]time.Time),
 		containerErrors: make(map[string]string),
 	}
-	app.loadAuto()
 	if host, err := os.Hostname(); err == nil && len(host) >= 12 {
 		app.selfCID = host[:12]
 		log.Printf("self CID: %s", app.selfCID)
@@ -285,6 +276,7 @@ func main() {
 	mux.HandleFunc("/api/images", app.handleImages)
 	mux.HandleFunc("/api/images/", app.handleImageAction)
 	mux.HandleFunc("/api/groups/", app.handleGroupAction)
+	mux.HandleFunc("/api/prune", app.handlePrune)
 	mux.HandleFunc("/api/ratelimit", app.handleRateLimit)
 	mux.HandleFunc("/api/login", handleLogin)
 	mux.HandleFunc("/api/logout", handleLogout)
@@ -341,6 +333,18 @@ func (app *App) handleRateLimit(w http.ResponseWriter, r *http.Request) {
 	app.mu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"rate_limited": rateLimited})
+}
+
+func (app *App) handlePrune(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	go func() {
+		pruneUnusedImages()
+		app.checkAll()
+	}()
+	w.Write([]byte(`{"status":"pruning"}`))
 }
 
 func (app *App) findContainer(cid string) *ContainerItem {
@@ -406,7 +410,6 @@ func (app *App) handleImageAction(w http.ResponseWriter, r *http.Request) {
 		go app.updateContainer(cid)
 		w.Write([]byte(`{"status":"updating"}`))
 	case "auto-update":
-		app.toggleAuto(cid)
 		app.mu.RLock()
 		c := app.findContainer(cid)
 		on := c != nil && c.AutoUpdate
@@ -444,20 +447,27 @@ func (app *App) handleGroupAction(w http.ResponseWriter, r *http.Request) {
 }
 
 func (app *App) updateGroup(image string) {
-	app.mu.RLock()
-	var cids []string
-	for _, g := range app.images {
-		if g.Image == image {
-			for _, c := range g.Containers {
-				cids = append(cids, c.ContainerID)
+	seen := map[string]bool{}
+	for {
+		cid := ""
+		app.mu.RLock()
+		for _, g := range app.images {
+			if g.Image == image {
+				for _, c := range g.Containers {
+					if c.Status == "outdated" && !seen[c.ContainerID] {
+						cid = c.ContainerID
+						seen[cid] = true
+						goto found
+					}
+				}
+				break
 			}
-			break
 		}
-	}
-	app.mu.RUnlock()
-
-	log.Printf("updating group %s (%d containers)", image, len(cids))
-	for _, cid := range cids {
+		app.mu.RUnlock()
+		break
+	found:
+		app.mu.RUnlock()
+		log.Printf("updating %s in group %s", cid, image)
 		app.updateContainer(cid)
 	}
 }
@@ -469,18 +479,12 @@ func (app *App) checkAll() {
 		return
 	}
 
-	app.mu.Lock()
-	autoMap := make(map[string]bool)
-	for k, v := range app.autoSaved {
-		autoMap[k] = v
-	}
-	app.mu.Unlock()
-
 	type groupEntry struct {
 		cid      string
 		name     string
 		imgID    string
 		imageTag string
+		labels   map[string]string
 	}
 	groups := make(map[string][]groupEntry)
 	for _, c := range containers {
@@ -512,6 +516,7 @@ func (app *App) checkAll() {
 			name:     entryName,
 			imgID:    c.ImageID,
 			imageTag: c.Image,
+			labels:   c.Labels,
 		})
 	}
 
@@ -564,7 +569,7 @@ func (app *App) checkAll() {
 				} else if remoteErr != nil {
 					item.LocalDigest = shortenDigest(localDigest)
 					item.Status = "unknown"
-				} else if localDigest != remoteDigest {
+				} else if !localDigestMatches(e.imgID, e.imageTag, remoteDigest) {
 					item.LocalDigest = shortenDigest(localDigest)
 					item.Status = "outdated"
 					gOutdated++
@@ -574,8 +579,8 @@ func (app *App) checkAll() {
 					gUpToDate++
 				}
 
-				if auto, ok := autoMap[e.cid]; ok {
-					item.AutoUpdate = auto
+				if e.labels["image-watch.auto-update"] == "true" {
+					item.AutoUpdate = true
 				}
 				app.mu.RLock()
 				item.Error = app.containerErrors[e.cid]
@@ -688,60 +693,31 @@ func (app *App) updateContainer(cid string) {
 	app.mu.Unlock()
 	app.progress.Store(cid, PullProgress{Status: "recreating", Percent: 100})
 	if err := recreateContainer(cid, image); err != nil {
+		app.mu.Lock()
+		app.containerErrors[cid] = err.Error()
+		app.mu.Unlock()
 		app.progress.Store(cid, PullProgress{Status: "error: " + err.Error()})
 		log.Printf("recreate %s: %v", cid, err)
+		app.checkAll()
 		return
+	}
+	var newDigest string
+	if d, err := getLocalDigest(image); err == nil {
+		newDigest = shortenDigest(d)
 	}
 	app.mu.Lock()
 	delete(app.containerErrors, cid)
+	if c := app.findContainer(cid); c != nil {
+		c.Status = "uptodate"
+		c.Error = ""
+		if newDigest != "" {
+			c.LocalDigest = newDigest
+		}
+	}
 	app.mu.Unlock()
 	app.progress.Delete(cid)
 	log.Printf("updated %s -> %s", containerName, image)
 	app.checkAll()
-}
-
-func (app *App) toggleAuto(cid string) {
-	if cid == app.selfCID {
-		return
-	}
-	app.mu.Lock()
-	defer app.mu.Unlock()
-	for i := range app.images {
-		for j := range app.images[i].Containers {
-			if app.images[i].Containers[j].ContainerID == cid {
-				app.images[i].Containers[j].AutoUpdate = !app.images[i].Containers[j].AutoUpdate
-				app.autoSaved[cid] = app.images[i].Containers[j].AutoUpdate
-				return
-			}
-		}
-	}
-}
-
-func (app *App) loadAuto() {
-	data, err := os.ReadFile(app.autoFile)
-	if err != nil {
-		return
-	}
-	app.mu.Lock()
-	defer app.mu.Unlock()
-	json.Unmarshal(data, &app.autoSaved)
-}
-
-func saveAuto(auto map[string]bool, p string) {
-	data, err := json.Marshal(auto)
-	if err != nil {
-		log.Printf("save auto: marshal: %v", err)
-		return
-	}
-	if i := strings.LastIndex(p, "/"); i > 0 {
-		if err := os.MkdirAll(p[:i], 0700); err != nil {
-			log.Printf("save auto: mkdir: %v", err)
-			return
-		}
-	}
-	if err := os.WriteFile(p, data, 0600); err != nil {
-		log.Printf("save auto: write: %v", err)
-	}
 }
 
 func shortenDigest(d string) string {

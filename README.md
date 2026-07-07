@@ -15,7 +15,6 @@ If you want stable/default deployment, keep using upstream image `ghcr.io/redenf
 docker run -d \
   --name image-watch \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  -v image-watch-data:/data \
   -p 8099:8080 \
   ghcr.io/redenfire/docker-image-watcher:latest
 ```
@@ -35,19 +34,14 @@ services:
       - "8099:8080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - image-watch-data:/data
     environment:
       - PORT=8080
       - DOCKER_SOCK=/var/run/docker.sock
-      - AUTO_FILE=/data/auto-update.json
       # - CHECK_INTERVAL=10m      # default: 10m
       # - CHECK_CONCURRENCY=5     # default: 5
       # - AUTO_COOLDOWN=5m        # default: 5m
       # - AUTH_USER=admin         # uncomment to enable auth
       # - AUTH_PASS=changeme
-
-volumes:
-  image-watch-data:
 ```
 
 ## Features
@@ -55,7 +49,7 @@ volumes:
 - Lists running containers grouped by image, with per-container status
 - Supports OCI-compatible registries including Docker Hub, GHCR, Quay, and self-hosted registries
 - One-click update per container or "Update all" per image group, with live progress bars
-- Per-container auto-update toggle persisted to disk
+- Per-container auto-update via Docker label `image-watch.auto-update`
 - Background check every 10 minutes with 5-minute auto-update cooldown
 - i18n with EN/IT language toggle
 - Optional auth via AUTH_USER/AUTH_PASS with login page and HMAC-signed session cookies
@@ -120,7 +114,6 @@ Full reference: [`docs/project/API.md`](docs/project/API.md)
 |---|---|---|
 | `PORT` | `8080` | HTTP listen port |
 | `DOCKER_SOCK` | `/var/run/docker.sock` | Docker Unix socket path |
-| `AUTO_FILE` | `/data/auto-update.json` | Persisted auto-update state file |
 | `AUTH_USER` | — | Enable HTTP auth (required together with AUTH_PASS) |
 | `AUTH_PASS` | — | Password for HTTP auth |
 | `CHECK_INTERVAL` | `10m` | Background check interval |
